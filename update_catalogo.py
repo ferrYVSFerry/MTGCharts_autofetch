@@ -6,62 +6,62 @@ import traceback
 import libsql_client
 from datetime import datetime
 
-# File sorgente che verranno scaricati da GitHub Actions
+# Source files downloaded by GitHub Actions
 INPUT_FILE = "AllIdentifiers.json"
 SET_FILE = "SetList.json"
 
-LAYOUT_SCARTATI = [
+DISCARDED_LAYOUTS = [
     "token", "double_faced_token", "emblem", "art_series", "vanguard", "planar", "scheme"
 ]
 BATCH_SIZE = 500
 
-async def aggiornamento_giornaliero():
-    print("▶️ [START] Avvio routine di aggiornamento catalogo...")
+async def daily_update():
+    print("[START] Starting catalog update routine...")
     
-    # 1. Recupero Credenziali da GitHub Secrets
+    # 1. Retrieve Credentials from GitHub Secrets
     url = os.environ.get("TURSO_DATABASE_URL")
     token = os.environ.get("TURSO_AUTH_TOKEN")
 
     if not url or not token:
-        print("❌ [ERRORE] Credenziali Turso non trovate nelle variabili d'ambiente!")
+        print("[ERROR] Turso credentials not found in environment variables!")
         return
 
-    # 2. Lettura dei Set Validi
-    oggi = datetime.now().strftime('%Y-%m-%d')
-    set_futuri = {}
+    # 2. Read Scheduled Sets
+    today = datetime.now().strftime('%Y-%m-%d')
+    future_sets = {}
     
     if not os.path.exists(SET_FILE) or not os.path.exists(INPUT_FILE):
-        print("❌ [ERRORE] File JSON mancanti. Assicurati che wget li abbia scaricati.")
+        print("[ERROR] JSON files missing. Ensure wget downloaded them.")
         return
 
-    print("📅 Lettura delle espansioni schedulate...")
+    print("Reading scheduled expansions...")
     with open(SET_FILE, 'r', encoding='utf-8') as sf:
         set_data = json.load(sf)
-        for espansione in set_data.get("data", []):
-            data_uscita = espansione.get("releaseDate")
-            codice_set = espansione.get("code")
-            if data_uscita and data_uscita > oggi:
-                set_futuri[codice_set] = True
+        for expansion in set_data.get("data", []):
+            release_date = expansion.get("releaseDate")
+            set_code = expansion.get("code")
+            if release_date and release_date > today:
+                future_sets[set_code] = True
 
-    # 3. Estrazione delle Carte
-    print("🔍 Filtraggio e preparazione delle carte valide in corso...")
-    carte_da_inviare = []
+    # 3. Extract and Filter Cards
+    print("Filtering and preparing valid cards...")
+    cards_to_send = []
     
     with open(INPUT_FILE, 'rb') as f:
-        oggetti = ijson.kvitems(f, 'data')
+        items = ijson.kvitems(f, 'data')
         
-        for card_uuid, card_data in oggetti:
+        for card_uuid, card_data in items:
             set_code = card_data.get("setCode")
             
-            # Filtri (Spoiler, Terre, Funny, Layout)
-            if set_code in set_futuri: continue
+            # Filters (Spoilers, Basic Lands, Funny Cards, Layouts)
+            if set_code in future_sets: continue
             if "Basic" in card_data.get("supertypes", []): continue
             if card_data.get("isFunny", False): continue
-            if card_data.get("layout", "") in LAYOUT_SCARTATI: continue
+            if card_data.get("layout", "") in DISCARDED_LAYOUTS: continue
 
-            # Prepara la carta validata
+            # Prepare the validated card
             identifiers = card_data.get("identifiers", {})
-            carte_da_inviare.append({
+            cards_to_send.append({
                 "uuid": card_uuid,
                 "name": card_data.get("name"),
                 "set_code": set_code,
@@ -72,11 +72,11 @@ async def aggiornamento_giornaliero():
                 "track_price": 0
             })
 
-    totale_carte = len(carte_da_inviare)
-    print(f"✅ Trovate {totale_carte:,} carte legali totali. Connessione a Turso...")
+    total_cards = len(cards_to_send)
+    print(f"Found {total_cards:,} total legal cards. Connecting to Turso...")
 
-    # 4. Invio al Database (OTTIMIZZATO)
-    # INSERT OR IGNORE permette di non sprecare scritture per le carte già presenti
+    # 4. Send to Database (OPTIMIZED)
+    # INSERT OR IGNORE avoids wasting writes for cards that are already present
     sql = """
     INSERT OR IGNORE INTO cards (uuid, name, set_code, number, scryfall_id, cardmarket_id, edhrec_rank, track_price)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -84,8 +84,8 @@ async def aggiornamento_giornaliero():
 
     try:
         async with libsql_client.create_client(url, auth_token=token) as client:
-            for i in range(0, totale_carte, BATCH_SIZE):
-                batch = carte_da_inviare[i : i + BATCH_SIZE]
+            for i in range(0, total_cards, BATCH_SIZE):
+                batch = cards_to_send[i : i + BATCH_SIZE]
                 statements = []
                 
                 for c in batch:
@@ -97,12 +97,12 @@ async def aggiornamento_giornaliero():
                 
                 await client.batch(statements)
                 
-        print("🎉 Aggiornamento giornaliero completato con successo!")
-        print("Le nuove uscite (se presenti) sono state aggiunte, le carte vecchie sono state ignorate in modo efficiente.")
+        print("Daily update completed successfully!")
+        print("New releases (if any) have been added, old cards have been efficiently ignored.")
         
     except Exception as e:
-        print(f"❌ [ERRORE DATABASE] Impossibile completare l'inserimento: {e}")
+        print(f"[DATABASE ERROR] Unable to complete insertion: {e}")
         traceback.print_exc()
 
 if __name__ == "__main__":
-    asyncio.run(aggiornamento_giornaliero())
+    asyncio.run(daily_update())

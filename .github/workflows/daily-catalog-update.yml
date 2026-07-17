@@ -1,0 +1,36 @@
+name: Turso Catalog Update
+
+on:
+  schedule:
+    # Runs every night at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    # Adds a button on GitHub to trigger the script manually
+
+jobs:
+  update-database:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Code Checkout
+        uses: actions/checkout@v4
+
+      - name: Python Setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install ijson libsql-client
+
+      - name: Download Fresh Data from MTGJSON
+        run: |
+          wget -qO AllIdentifiers.json https://mtgjson.com/api/v5/AllIdentifiers.json
+          wget -qO SetList.json https://mtgjson.com/api/v5/SetList.json
+
+      - name: Execute Update
+        env:
+          # GitHub will securely inject your secrets here
+          TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
+          TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
+        run: python3 update_catalogo.py

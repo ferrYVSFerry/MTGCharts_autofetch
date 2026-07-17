@@ -1,0 +1,33 @@
+name: MTG Daily Price Updater
+
+# Regole di avvio
+on:
+  schedule:
+    # Esegue ogni mattina alle 04:00 UTC (05:00 o 06:00 in Italia)
+    - cron: '0 4 * * *'
+  # Permette anche di lanciare lo script manualmente con un bottone
+  workflow_dispatch: 
+
+jobs:
+  update-database:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del codice
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Installazione librerie
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psycopg2-binary
+
+      - name: Esecuzione script di aggiornamento
+        env:
+          # Passa il segreto di Supabase allo script Python
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python update_prices.py

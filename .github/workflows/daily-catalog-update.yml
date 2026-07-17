@@ -3,7 +3,7 @@ name: Turso Catalog Update
 on:
   schedule:
     # Runs every night at 03:00 UTC
-    - cron: '0 3 * * *'
+    - cron: '0 3 * * 1'
   workflow_dispatch:
     # Adds a button on GitHub to trigger the script manually
 

@@ -1,14 +1,14 @@
-name: Turso Catalog Update
+name: Daily Prices Update and Cleanup
 
 on:
   schedule:
-    # Runs every night at 03:00 UTC
-    - cron: '0 3 * * 1'
+    # Runs every night at 03:30 UTC
+    - cron: '30 3 * * *'
   workflow_dispatch:
-    # Adds a button on GitHub to trigger the script manually
+    # Allows manual trigger via the GitHub UI
 
 jobs:
-  update-database:
+  update-prices:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,14 +23,13 @@ jobs:
       - name: Install Dependencies
         run: pip install ijson libsql-client
 
-      - name: Download Fresh Data from MTGJSON
+      - name: Download Prices Data from MTGJSON
         run: |
-          wget -qO AllIdentifiers.json https://mtgjson.com/api/v5/AllIdentifiers.json
-          wget -qO SetList.json https://mtgjson.com/api/v5/SetList.json
+          echo "Downloading AllPrices.json..."
+          wget -qO AllPrices.json https://mtgjson.com/api/v5/AllPrices.json
 
-      - name: Execute Update
+      - name: Execute Price Update and Cleanup
         env:
-          # GitHub will securely inject your secrets here
           TURSO_DATABASE_URL: ${{ secrets.TURSO_DATABASE_URL }}
           TURSO_AUTH_TOKEN: ${{ secrets.TURSO_AUTH_TOKEN }}
-        run: python3 update_catalogo.py
+        run: python3 update_prices.py

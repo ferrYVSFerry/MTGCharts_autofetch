@@ -1,0 +1,31 @@
+name: Daily MTG Database Update
+
+on:
+  schedule:
+    # Runs at 23:00 UTC every day (01:00 AM Italian time during Summer/CEST)
+    - cron: '0 23 * * *'
+  workflow_dispatch: # Allows you to trigger the script manually from the GitHub UI
+
+jobs:
+  update-database:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests psycopg2-binary
+
+      - name: Run Database Update Script
+        env:
+          # This pulls the secret securely from your GitHub Repository Secrets
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python update_mtg_database.py

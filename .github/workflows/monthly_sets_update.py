@@ -1,0 +1,31 @@
+name: Monthly MTG Sets Update
+
+on:
+  schedule:
+    # Esegue al minuto 0, ora 0, giorno 1 di ogni mese (00:00 UTC del 1° del mese)
+    - cron: '0 0 1 * *'
+  workflow_dispatch: # Permette l'avvio manuale dal pannello GitHub
+
+jobs:
+  update-sets-database:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Sets Database Update Script
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python update_mtg_sets.py

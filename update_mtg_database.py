@@ -13,6 +13,7 @@ from datetime import datetime
 SCRYFALL_BULK_URL = "https://api.scryfall.com/bulk-data"
 MTGJSON_PRICES_URL = "https://mtgjson.com/api/v5/AllPricesToday.json.zip"
 MTGJSON_IDENTIFIERS_URL = "https://mtgjson.com/api/v5/AllIdentifiers.json.zip"
+EXCHANGE_RATE_API_URL = "https://api.frankfurter.app/latest?from=USD&to=EUR"
 
 DATABASE_URL = os.getenv("SUPABASE_DB_URL")
 
@@ -24,7 +25,7 @@ TEMP_MTGJSON_PRICES = "AllPricesToday.json"
 TEMP_MTGJSON_IDENTIFIERS = "AllIdentifiers.json"
 
 HEADERS = {
-    "User-Agent": "MtgArbitrageApp-GitHubActions/2.5",
+    "User-Agent": "MtgArbitrageApp-GitHubActions/3.0",
     "Accept": "application/json"
 }
 
@@ -34,6 +35,23 @@ MAJOR_FORMATS = [
 ]
 
 CURRENT_DATE = datetime.now().strftime("%Y-%m-%d")
+
+
+def get_usd_to_eur_rate():
+    """Fetches the live USD to EUR exchange rate using a free API."""
+    print("-> Fetching live USD to EUR exchange rate...")
+    try:
+        response = requests.get(EXCHANGE_RATE_API_URL, timeout=10)
+        response.raise_for_status()
+        rate = response.json().get('rates', {}).get('EUR')
+        if rate:
+            print(f"   Live rate fetched: 1 USD = {rate} EUR")
+            return float(rate)
+        else:
+            raise ValueError("Rate not found in API response")
+    except Exception as e:
+        print(f"   WARNING: Failed to fetch live rate ({e}). Using fallback rate of 0.92")
+        return 0.92
 
 
 def download_file(url, filepath, description):
@@ -115,31 +133,35 @@ def is_playable(card):
     return True
 
 
-def calculate_arbitrage_score(price_eur, price_usd, edhrec_rank):
-    """Calculates the Arbitrage Score based on the mathematical model."""
+def calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate):
+    """Calculates the Arbitrage Score and the Estimated Net Profit using live exchange rates."""
     if not price_eur or not price_usd or price_eur <= 0:
-        return None
+        return None, None
 
     rank = edhrec_rank if edhrec_rank is not None else 10000
-    base_cost_eur = price_usd * 0.92
     
-    # Apply import duties and VAT
+    # Conversione dinamica USD -> EUR
+    base_cost_eur = price_usd * exchange_rate
+    
+    # Applicazione tasse totali escluse spese di spedizione (IVA + eventuali dazi)
     if base_cost_eur <= 150.00:
-        landed_cost = base_cost_eur * 1.22  # 22% VAT
+        landed_cost = base_cost_eur * 1.22  # 22% IVA
     else:
-        landed_cost = base_cost_eur * 1.25  # 22% VAT + 3% Customs Duty
+        landed_cost = base_cost_eur * 1.25  # 22% IVA + 3% Dazi Doganali
+
+    # Calcolo del profitto netto
+    estimated_profit = price_eur - landed_cost
 
     try:
-        numerator = price_eur - landed_cost
         denominator = math.sqrt(rank + 1) * math.log(price_eur + 1)
-        score = numerator / denominator
-        return round(score, 2)
+        score = estimated_profit / denominator
+        return round(score, 2), round(estimated_profit, 2)
     except ZeroDivisionError:
-        return None
+        return None, round(estimated_profit, 2)
 
 
-def transform_and_prepare_records(tcg_price_map):
-    """Filters raw cards, merges MTGJSON median prices, and calculates scores."""
+def transform_and_prepare_records(tcg_price_map, exchange_rate):
+    """Filters raw cards, merges datasets, and calculates scores using live exchange rates."""
     print("-> Filtering cards and merging datasets...")
     records = []
     
@@ -169,8 +191,8 @@ def transform_and_prepare_records(tcg_price_map):
         legal_formats = [fmt for fmt in MAJOR_FORMATS if legalities.get(fmt) in ["legal", "restricted"]]
         edhrec_rank = card.get("edhrec_rank")
         
-        # Calculate Arbitrage Score
-        arbitrage_score = calculate_arbitrage_score(price_eur, price_usd, edhrec_rank)
+        # Calculate Arbitrage Score and Profit using dynamic rate
+        arbitrage_score, estimated_profit_eur = calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate)
         
         # Prepare PostgreSQL tuple
         records.append((
@@ -183,7 +205,8 @@ def transform_and_prepare_records(tcg_price_map):
             legal_formats,
             edhrec_rank,
             card.get("set_type"),
-            arbitrage_score
+            arbitrage_score,
+            estimated_profit_eur
         ))
         
     print(f"   Valid cards ready for database UPSERT: {len(records)}")
@@ -204,6 +227,9 @@ def main():
         raise ValueError("CRITICAL ERROR: SUPABASE_DB_URL environment variable is missing!")
 
     print("=== STARTING DAILY MTG DATABASE PIPELINE ===")
+    
+    # 0. FETCH LIVE EXCHANGE RATE
+    exchange_rate = get_usd_to_eur_rate()
     
     # 1. FETCH SCRYFALL BULK DATA
     print("\n[Step 1/5] Fetching Scryfall metadata and dataset...")
@@ -226,7 +252,7 @@ def main():
     # 3. TRANSFORM AND MERGE
     print("\n[Step 3/5] Processing, mapping, and calculating scores...")
     tcg_price_map = build_mtgjson_price_map()
-    records = transform_and_prepare_records(tcg_price_map)
+    records = transform_and_prepare_records(tcg_price_map, exchange_rate)
 
     # 4. DATABASE UPSERT
     print("\n[Step 4/5] Connecting to Supabase and executing bulk UPSERT...")
@@ -238,7 +264,7 @@ def main():
                 INSERT INTO public.cards (
                     scryfall_id, name, set_code, price_eur, price_usd, 
                     price_usd_median, legal_formats, edhrec_rank, set_type,
-                    arbitrage_score
+                    arbitrage_score, estimated_profit_eur
                 )
                 VALUES %s
                 ON CONFLICT (scryfall_id) 
@@ -249,7 +275,8 @@ def main():
                     legal_formats = EXCLUDED.legal_formats,
                     edhrec_rank = EXCLUDED.edhrec_rank,
                     set_type = EXCLUDED.set_type,
-                    arbitrage_score = EXCLUDED.arbitrage_score;
+                    arbitrage_score = EXCLUDED.arbitrage_score,
+                    estimated_profit_eur = EXCLUDED.estimated_profit_eur;
             """
             execute_values(cursor, upsert_query, records, page_size=1000)
         conn.commit()

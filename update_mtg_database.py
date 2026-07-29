@@ -10,7 +10,6 @@ from psycopg2.extras import execute_values
 from datetime import datetime
 
 # --- CONFIGURATION CONSTANTS ---
-# Puntiamo direttamente all'oggetto default_cards per evitare problemi di parsing
 SCRYFALL_BULK_URL = "https://api.scryfall.com/bulk-data/default_cards"
 MTGJSON_PRICES_URL = "https://mtgjson.com/api/v5/AllPricesToday.json.zip"
 MTGJSON_IDENTIFIERS_URL = "https://mtgjson.com/api/v5/AllIdentifiers.json.zip"
@@ -25,9 +24,8 @@ TEMP_MTGJSON_IDENTIFIERS_ZIP = "AllIdentifiers.json.zip"
 TEMP_MTGJSON_PRICES = "AllPricesToday.json"
 TEMP_MTGJSON_IDENTIFIERS = "AllIdentifiers.json"
 
-# Inserisci un'email valida nell'User-Agent per rispettare le API Policy di Scryfall
 HEADERS = {
-    "User-Agent": "MtgArbitrageApp-GitHubActions/3.0 (info@mtgarbitrage.com)",
+    "User-Agent": "MtgArbitrageApp-GitHubActions/3.1 (info@mtgarbitrage.com)",
     "Accept": "application/json"
 }
 
@@ -235,10 +233,18 @@ def main():
     
     # 1. FETCH SCRYFALL BULK DATA
     print("\n[Step 1/5] Fetching Scryfall metadata and dataset...")
+    
     response = requests.get(SCRYFALL_BULK_URL, headers=HEADERS)
+    
+    # --- BLOCCO DI DEBUG AGGIUNTO ---
+    print("\n--- INIZIO RISPOSTA SCRYFALL ---")
+    print(f"Status Code: {response.status_code}")
+    print(response.text[:1000]) # Stampiamo i primi 1000 caratteri
+    print("--- FINE RISPOSTA SCRYFALL ---\n")
+    
     response.raise_for_status()
     
-    # Lettura diretta dell'URI dall'oggetto JSON restituito da Scryfall
+    # Estrazione diretta
     download_uri = response.json().get("download_uri")
     
     if not download_uri:

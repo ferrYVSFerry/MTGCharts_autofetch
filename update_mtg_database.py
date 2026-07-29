@@ -5,6 +5,7 @@ import math
 import zipfile
 import requests
 import psycopg2
+import gzip
 from psycopg2 import pool
 from psycopg2.extras import execute_values
 from datetime import datetime
@@ -18,14 +19,14 @@ EXCHANGE_RATE_API_URL = "https://api.frankfurter.app/latest?from=USD&to=EUR"
 DATABASE_URL = os.getenv("SUPABASE_DB_URL")
 
 # File paths in GitHub Actions workspace
-TEMP_SCRYFALL_FILE = "scryfall_raw.json"
+TEMP_SCRYFALL_FILE = "scryfall_raw.dat" # Rinominato perché ora può essere un file .gz
 TEMP_MTGJSON_PRICES_ZIP = "AllPricesToday.json.zip"
 TEMP_MTGJSON_IDENTIFIERS_ZIP = "AllIdentifiers.json.zip"
 TEMP_MTGJSON_PRICES = "AllPricesToday.json"
 TEMP_MTGJSON_IDENTIFIERS = "AllIdentifiers.json"
 
 HEADERS = {
-    "User-Agent": "MtgArbitrageApp-GitHubActions/3.1 (info@mtgarbitrage.com)",
+    "User-Agent": "MtgArbitrageApp-GitHubActions/3.2 (info@mtgarbitrage.com)",
     "Accept": "application/json"
 }
 
@@ -160,55 +161,83 @@ def calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate):
         return None, round(estimated_profit, 2)
 
 
+def process_single_card(card, tcg_price_map, exchange_rate):
+    """Helper che estrae i dati dalla singola carta per evitare codice ripetuto."""
+    if not is_playable(card):
+        return None
+        
+    prices = card.get("prices", {})
+    price_usd_raw = prices.get("usd") or prices.get("usd_foil")
+    
+    if price_usd_raw is None:
+        return None
+        
+    price_eur_raw = prices.get("eur") or prices.get("eur_foil")
+    price_eur = float(price_eur_raw) if price_eur_raw is not None else None
+    price_usd = float(price_usd_raw)
+    
+    tcg_id = str(card.get("tcgplayer_id")) if card.get("tcgplayer_id") else None
+    price_usd_median = tcg_price_map.get(tcg_id) if tcg_id else None
+    
+    legalities = card.get("legalities", {})
+    legal_formats = [fmt for fmt in MAJOR_FORMATS if legalities.get(fmt) in ["legal", "restricted"]]
+    edhrec_rank = card.get("edhrec_rank")
+    
+    arbitrage_score, estimated_profit_eur = calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate)
+    
+    return (
+        card.get("id"),
+        card.get("name"),
+        card.get("set"),
+        price_eur,
+        price_usd,
+        price_usd_median,
+        legal_formats,
+        edhrec_rank,
+        card.get("set_type"),
+        arbitrage_score,
+        estimated_profit_eur
+    )
+
+
 def transform_and_prepare_records(tcg_price_map, exchange_rate):
-    """Filters raw cards, merges datasets, and calculates scores using live exchange rates."""
+    """Filters raw cards, merges datasets, and handles both JSON and JSONL formats."""
     print("-> Filtering cards and merging datasets...")
     records = []
     
-    with open(TEMP_SCRYFALL_FILE, 'r', encoding='utf-8') as f:
-        all_cards = json.load(f)
+    # 1. Controlla se il file è gzippato analizzando i primi 2 byte (Magic Number)
+    with open(TEMP_SCRYFALL_FILE, 'rb') as test_f:
+        magic_number = test_f.read(2)
+    is_gzipped = (magic_number == b'\x1f\x8b')
+    
+    open_func = gzip.open if is_gzipped else open
+    
+    # 2. Apri il file e analizzalo
+    with open_func(TEMP_SCRYFALL_FILE, 'rt', encoding='utf-8') as f:
+        first_char = f.read(1)
+        f.seek(0)
         
-    for card in all_cards:
-        if not is_playable(card):
-            continue
-            
-        prices = card.get("prices", {})
-        price_usd_raw = prices.get("usd") or prices.get("usd_foil")
-        
-        # Strict Rule: Must have a valid US market price
-        if price_usd_raw is None:
-            continue
-            
-        price_eur_raw = prices.get("eur") or prices.get("eur_foil")
-        price_eur = float(price_eur_raw) if price_eur_raw is not None else None
-        price_usd = float(price_usd_raw)
-        
-        # Lookup median price from MTGJSON mapping
-        tcg_id = str(card.get("tcgplayer_id")) if card.get("tcgplayer_id") else None
-        price_usd_median = tcg_price_map.get(tcg_id) if tcg_id else None
-        
-        legalities = card.get("legalities", {})
-        legal_formats = [fmt for fmt in MAJOR_FORMATS if legalities.get(fmt) in ["legal", "restricted"]]
-        edhrec_rank = card.get("edhrec_rank")
-        
-        # Calculate Arbitrage Score and Profit using dynamic rate
-        arbitrage_score, estimated_profit_eur = calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate)
-        
-        # Prepare PostgreSQL tuple
-        records.append((
-            card.get("id"),
-            card.get("name"),
-            card.get("set"),
-            price_eur,
-            price_usd,
-            price_usd_median,
-            legal_formats,
-            edhrec_rank,
-            card.get("set_type"),
-            arbitrage_score,
-            estimated_profit_eur
-        ))
-        
+        if first_char == '[':
+            print("   Formato rilevato: JSON Array standard")
+            all_cards = json.load(f)
+            for card in all_cards:
+                record = process_single_card(card, tcg_price_map, exchange_rate)
+                if record:
+                    records.append(record)
+        else:
+            print("   Formato rilevato: JSON Lines (JSONL)")
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    card = json.loads(line)
+                    record = process_single_card(card, tcg_price_map, exchange_rate)
+                    if record:
+                        records.append(record)
+                except json.JSONDecodeError:
+                    continue
+                    
     print(f"   Valid cards ready for database UPSERT: {len(records)}")
     return records
 
@@ -233,24 +262,17 @@ def main():
     
     # 1. FETCH SCRYFALL BULK DATA
     print("\n[Step 1/5] Fetching Scryfall metadata and dataset...")
-    
     response = requests.get(SCRYFALL_BULK_URL, headers=HEADERS)
-    
-    # --- BLOCCO DI DEBUG AGGIUNTO ---
-    print("\n--- INIZIO RISPOSTA SCRYFALL ---")
-    print(f"Status Code: {response.status_code}")
-    print(response.text[:1000]) # Stampiamo i primi 1000 caratteri
-    print("--- FINE RISPOSTA SCRYFALL ---\n")
-    
     response.raise_for_status()
     
-    # Estrazione diretta
-    download_uri = response.json().get("download_uri")
+    # Cerchiamo il nuovo formato JSONL, se non c'è facciamo un fallback al vecchio formato
+    response_data = response.json()
+    download_uri = response_data.get("jsonl_download_uri") or response_data.get("download_uri")
     
     if not download_uri:
-        raise Exception("Could not locate download URI for Scryfall Default Cards.")
+        raise Exception("Could not locate any download URI (jsonl or standard) for Scryfall Default Cards.")
         
-    download_file(download_uri, TEMP_SCRYFALL_FILE, "Scryfall Bulk Data")
+    download_file(download_uri, TEMP_SCRYFALL_FILE, f"Scryfall Bulk Data ({'GZIP JSONL' if 'jsonl' in download_uri else 'JSON'})")
 
     # 2. FETCH AND EXTRACT MTGJSON DATA
     print("\n[Step 2/5] Fetching MTGJSON compressed datasets...")

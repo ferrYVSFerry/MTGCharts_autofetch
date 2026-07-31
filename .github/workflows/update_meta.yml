@@ -1,0 +1,33 @@
+name: MTG Meta Scraper (Every 3 Days)
+
+on:
+  schedule:
+    # Esegue il job alle 03:00 UTC ogni 3 giorni (es. il 1, 4, 7 del mese ecc.)
+    - cron: '0 3 */3 * *'
+  # Permette di eseguire il workflow manualmente
+  workflow_dispatch:
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout del repository
+        uses: actions/checkout@v4
+
+      - name: Setup di Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Installazione dipendenze
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 psycopg2-binary
+
+      - name: Esecuzione dello scraper
+        env:
+          # Assicurati che SUPABASE_DB_URL sia inserito nei Secrets del repository!
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python meta_scraper.py

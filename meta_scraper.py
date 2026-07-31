@@ -51,7 +51,7 @@ def estrai_formato(formato, conn):
         print(f"❌ Errore: Nessun mazzo trovato per {formato}. (Operazione annullata)")
         return
 
-    # --- PULIZIA VECCHI DATI (DELETE NATIVO SQL) ---
+    # --- PULIZIA VECCHI DATI ---
     print(f"🧹 Pulizia dei vecchi mazzi {formato.upper()} nel database...")
     try:
         with conn.cursor() as cursor:
@@ -120,7 +120,8 @@ def estrai_formato(formato, conn):
                     testo_mazzo = deck_input['value'].strip()
                     righe = testo_mazzo.split('\n')
                     
-                    carte_parsate = []
+                    # === MODIFICA: Aggregazione delle quantità per nome carta ===
+                    carte_aggregate = {}
                     nomi_univoci = set()
                     is_sideboard = False
                     
@@ -135,11 +136,15 @@ def estrai_formato(formato, conn):
                         
                         quantita, nome_carta = parse_card_line(riga_pulita)
                         
-                        carte_parsate.append({
-                            "card_name": nome_carta,
-                            "quantity": quantita,
-                            "is_sideboard": is_sideboard
-                        })
+                        # Creiamo una chiave univoca basata sul nome e sulla posizione (mainboard/sideboard)
+                        chiave = (nome_carta, is_sideboard)
+                        
+                        # Se la carta è già presente, sommiamo la quantità. Altrimenti la inizializziamo.
+                        if chiave in carte_aggregate:
+                            carte_aggregate[chiave] += quantita
+                        else:
+                            carte_aggregate[chiave] = quantita
+                            
                         nomi_univoci.add(nome_carta)
                     
                     # 4. BULK LOOKUP ID tramite query SQL nativa
@@ -160,15 +165,15 @@ def estrai_formato(formato, conn):
                             print(f"⚠️ Errore durante la ricerca degli ID delle carte: {e}")
                             conn.rollback()
                     
-                    # 5. Costruzione tuple per inserimento in blocco
+                    # 5. Costruzione tuple per inserimento in blocco dal dizionario aggregato
                     carte_da_inserire = []
-                    for c in carte_parsate:
+                    for (nome_carta, is_sb), quantita in carte_aggregate.items():
                         carte_da_inserire.append((
                             deck_id,
-                            c["card_name"],
-                            mappa_id.get(c["card_name"]),
-                            c["quantity"],
-                            c["is_sideboard"]
+                            nome_carta,
+                            mappa_id.get(nome_carta),
+                            quantita,
+                            is_sb
                         ))
                     
                     # 6. Inserimento massivo in deck_cards
@@ -196,7 +201,6 @@ def main():
 
     print("🚀 INIZIO OPERAZIONE DI SCRAPING E SINCRONIZZAZIONE DB...")
     
-    # Inizializzazione Pool di connessione come nel tuo altro script
     connection_pool = psycopg2.pool.SimpleConnectionPool(1, 5, DATABASE_URL)
     conn = connection_pool.getconn()
     

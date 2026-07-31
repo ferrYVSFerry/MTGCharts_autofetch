@@ -19,14 +19,14 @@ EXCHANGE_RATE_API_URL = "https://api.frankfurter.app/latest?from=USD&to=EUR"
 DATABASE_URL = os.getenv("SUPABASE_DB_URL")
 
 # File paths in GitHub Actions workspace
-TEMP_SCRYFALL_FILE = "scryfall_raw.dat" # Rinominato perché ora può essere un file .gz
+TEMP_SCRYFALL_FILE = "scryfall_raw.dat"
 TEMP_MTGJSON_PRICES_ZIP = "AllPricesToday.json.zip"
 TEMP_MTGJSON_IDENTIFIERS_ZIP = "AllIdentifiers.json.zip"
 TEMP_MTGJSON_PRICES = "AllPricesToday.json"
 TEMP_MTGJSON_IDENTIFIERS = "AllIdentifiers.json"
 
 HEADERS = {
-    "User-Agent": "MtgArbitrageApp-GitHubActions/3.2 (info@mtgarbitrage.com)",
+    "User-Agent": "MtgArbitrageApp-GitHubActions/3.3 (info@mtgarbitrage.com)",
     "Accept": "application/json"
 }
 
@@ -135,9 +135,10 @@ def is_playable(card):
 
 
 def calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate):
-    """Calculates the Arbitrage Score and the Estimated Net Profit using live exchange rates."""
-    if not price_eur or not price_usd or price_eur <= 0:
-        return None, None
+    """Calculates Arbitrage Score, Estimated Net Profit, and ROI Ratio."""
+    # Controllo per evitare divisioni per zero anche sul prezzo USD
+    if not price_eur or not price_usd or price_eur <= 0 or price_usd <= 0:
+        return None, None, None
 
     rank = edhrec_rank if edhrec_rank is not None else 10000
     
@@ -152,13 +153,17 @@ def calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate):
 
     # Calcolo del profitto netto
     estimated_profit = price_eur - landed_cost
+    
+    # NUOVO CALCOLO: Rapporto Profitto / Costo di Acquisto
+    # Esempio: se spendo 10€ e guadagno netto 5€, il ratio è 0.5 (ovvero 50%)
+    profit_ratio = round(estimated_profit / landed_cost, 4) if landed_cost > 0 else None
 
     try:
         denominator = math.sqrt(rank + 1) * math.log(price_eur + 1)
         score = estimated_profit / denominator
-        return round(score, 2), round(estimated_profit, 2)
+        return round(score, 2), round(estimated_profit, 2), profit_ratio
     except ZeroDivisionError:
-        return None, round(estimated_profit, 2)
+        return None, round(estimated_profit, 2), profit_ratio
 
 
 def process_single_card(card, tcg_price_map, exchange_rate):
@@ -183,7 +188,8 @@ def process_single_card(card, tcg_price_map, exchange_rate):
     legal_formats = [fmt for fmt in MAJOR_FORMATS if legalities.get(fmt) in ["legal", "restricted"]]
     edhrec_rank = card.get("edhrec_rank")
     
-    arbitrage_score, estimated_profit_eur = calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate)
+    # Adesso la funzione restituisce tre valori
+    arbitrage_score, estimated_profit_eur, profit_ratio = calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate)
     
     return (
         card.get("id"),
@@ -196,7 +202,8 @@ def process_single_card(card, tcg_price_map, exchange_rate):
         edhrec_rank,
         card.get("set_type"),
         arbitrage_score,
-        estimated_profit_eur
+        estimated_profit_eur,
+        profit_ratio # <-- Il nuovo campo aggiunto alla tupla
     )
 
 
@@ -205,14 +212,12 @@ def transform_and_prepare_records(tcg_price_map, exchange_rate):
     print("-> Filtering cards and merging datasets...")
     records = []
     
-    # 1. Controlla se il file è gzippato analizzando i primi 2 byte (Magic Number)
     with open(TEMP_SCRYFALL_FILE, 'rb') as test_f:
         magic_number = test_f.read(2)
     is_gzipped = (magic_number == b'\x1f\x8b')
     
     open_func = gzip.open if is_gzipped else open
     
-    # 2. Apri il file e analizzalo
     with open_func(TEMP_SCRYFALL_FILE, 'rt', encoding='utf-8') as f:
         first_char = f.read(1)
         f.seek(0)
@@ -257,15 +262,12 @@ def main():
 
     print("=== STARTING DAILY MTG DATABASE PIPELINE ===")
     
-    # 0. FETCH LIVE EXCHANGE RATE
     exchange_rate = get_usd_to_eur_rate()
     
-    # 1. FETCH SCRYFALL BULK DATA
     print("\n[Step 1/5] Fetching Scryfall metadata and dataset...")
     response = requests.get(SCRYFALL_BULK_URL, headers=HEADERS)
     response.raise_for_status()
     
-    # Cerchiamo il nuovo formato JSONL, se non c'è facciamo un fallback al vecchio formato
     response_data = response.json()
     download_uri = response_data.get("jsonl_download_uri") or response_data.get("download_uri")
     
@@ -274,7 +276,6 @@ def main():
         
     download_file(download_uri, TEMP_SCRYFALL_FILE, f"Scryfall Bulk Data ({'GZIP JSONL' if 'jsonl' in download_uri else 'JSON'})")
 
-    # 2. FETCH AND EXTRACT MTGJSON DATA
     print("\n[Step 2/5] Fetching MTGJSON compressed datasets...")
     download_file(MTGJSON_PRICES_URL, TEMP_MTGJSON_PRICES_ZIP, "MTGJSON Prices (ZIP)")
     extract_zip(TEMP_MTGJSON_PRICES_ZIP)
@@ -282,22 +283,21 @@ def main():
     download_file(MTGJSON_IDENTIFIERS_URL, TEMP_MTGJSON_IDENTIFIERS_ZIP, "MTGJSON Identifiers (ZIP)")
     extract_zip(TEMP_MTGJSON_IDENTIFIERS_ZIP)
 
-    # 3. TRANSFORM AND MERGE
     print("\n[Step 3/5] Processing, mapping, and calculating scores...")
     tcg_price_map = build_mtgjson_price_map()
     records = transform_and_prepare_records(tcg_price_map, exchange_rate)
 
-    # 4. DATABASE UPSERT
     print("\n[Step 4/5] Connecting to Supabase and executing bulk UPSERT...")
     connection_pool = psycopg2.pool.SimpleConnectionPool(1, 5, DATABASE_URL)
     conn = connection_pool.getconn()
     try:
         with conn.cursor() as cursor:
+            # Query aggiornata con la nuova colonna profit_ratio
             upsert_query = """
                 INSERT INTO public.cards (
                     scryfall_id, name, set_code, price_eur, price_usd, 
                     price_usd_median, legal_formats, edhrec_rank, set_type,
-                    arbitrage_score, estimated_profit_eur
+                    arbitrage_score, estimated_profit_eur, profit_ratio
                 )
                 VALUES %s
                 ON CONFLICT (scryfall_id) 
@@ -309,7 +309,8 @@ def main():
                     edhrec_rank = EXCLUDED.edhrec_rank,
                     set_type = EXCLUDED.set_type,
                     arbitrage_score = EXCLUDED.arbitrage_score,
-                    estimated_profit_eur = EXCLUDED.estimated_profit_eur;
+                    estimated_profit_eur = EXCLUDED.estimated_profit_eur,
+                    profit_ratio = EXCLUDED.profit_ratio;
             """
             execute_values(cursor, upsert_query, records, page_size=1000)
         conn.commit()
@@ -322,7 +323,6 @@ def main():
         connection_pool.putconn(conn)
         connection_pool.closeall()
         
-    # 5. CLEANUP
     print("\n[Step 5/5] Cleaning up workspace...")
     clean_up_temp_files()
     

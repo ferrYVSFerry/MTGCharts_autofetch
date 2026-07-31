@@ -2,9 +2,7 @@ name: MTG Meta Scraper (Every 3 Days)
 
 on:
   schedule:
-    # Esegue il job alle 03:00 UTC ogni 3 giorni (es. il 1, 4, 7 del mese ecc.)
     - cron: '0 3 */3 * *'
-  # Permette di eseguire il workflow manualmente
   workflow_dispatch:
 
 jobs:
@@ -19,7 +17,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          # ATTENZIONE: Riga "cache: 'pip'" rimossa per risolvere l'errore
 
       - name: Installazione dipendenze
         run: |
@@ -28,6 +26,5 @@ jobs:
 
       - name: Esecuzione dello scraper
         env:
-          # Assicurati che SUPABASE_DB_URL sia inserito nei Secrets del repository!
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: python meta_scraper.py

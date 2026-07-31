@@ -51,7 +51,7 @@ def estrai_formato(formato, conn):
         print(f"❌ Errore: Nessun mazzo trovato per {formato}. (Operazione annullata)")
         return
 
-    # --- PULIZIA VECCHI DATI ---
+    # --- PULIZIA VECCHI DATI (DELETE NATIVO SQL) ---
     print(f"🧹 Pulizia dei vecchi mazzi {formato.upper()} nel database...")
     try:
         with conn.cursor() as cursor:
@@ -67,7 +67,7 @@ def estrai_formato(formato, conn):
     # --- ESTRAZIONE E INSERIMENTO NUOVI DATI ---
     for indice, archetype in enumerate(mazzi_meta, start=1):
         
-        # 1. Estrazione Dati Mazzo
+        # 1. Estrazione Dati Base Mazzo
         title_container = archetype.find('div', class_='archetype-tile-title')
         paper_span = title_container.find('span', class_='deck-price-paper') if title_container else None
         link_tag = paper_span.find('a') if paper_span else None
@@ -78,6 +78,17 @@ def estrai_formato(formato, conn):
         nome_mazzo = link_tag.text.strip()
         deck_url = urljoin(BASE_URL, link_tag['href'])
         
+        # === ESTRAZIONE SINGOLA CARTA DI COPERTINA DALLA HOME ===
+        carta_rappresentativa = None
+        img_container = archetype.find('div', class_='archetype-tile-image')
+        if img_container:
+            card_tile = img_container.find('div', class_='card-tile')
+            if card_tile:
+                aria_label = card_tile.get('aria-label', '')
+                if aria_label.startswith('Image of '):
+                    carta_rappresentativa = aria_label.replace('Image of ', '').strip()
+        
+        # Estrazione percentuale meta
         stats_container = archetype.find('div', class_='archetype-tile-statistics')
         percentuale_val = None
         if stats_container:
@@ -89,17 +100,17 @@ def estrai_formato(formato, conn):
                 except ValueError:
                     percentuale_val = None
 
-        print(f"[{indice}/{len(mazzi_meta)}] Salvataggio: {nome_mazzo}...")
+        print(f"[{indice}/{len(mazzi_meta)}] Salvataggio: {nome_mazzo} (Copertina: {carta_rappresentativa})")
         
         # 2. Inserimento Mazzo su DB tramite SQL
         deck_id = None
         try:
             with conn.cursor() as cursor:
                 cursor.execute("""
-                    INSERT INTO public.decks (name, format, meta_percent, source_url)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO public.decks (name, format, meta_percent, source_url, representative_card)
+                    VALUES (%s, %s, %s, %s, %s)
                     RETURNING id;
-                """, (nome_mazzo, formato, percentuale_val, deck_url))
+                """, (nome_mazzo, formato, percentuale_val, deck_url, carta_rappresentativa))
                 deck_id = cursor.fetchone()[0]
             conn.commit()
         except Exception as e:
@@ -120,7 +131,7 @@ def estrai_formato(formato, conn):
                     testo_mazzo = deck_input['value'].strip()
                     righe = testo_mazzo.split('\n')
                     
-                    # === MODIFICA: Aggregazione delle quantità per nome carta ===
+                    # Aggregazione delle quantità per nome carta per evitare duplicati
                     carte_aggregate = {}
                     nomi_univoci = set()
                     is_sideboard = False
@@ -136,10 +147,7 @@ def estrai_formato(formato, conn):
                         
                         quantita, nome_carta = parse_card_line(riga_pulita)
                         
-                        # Creiamo una chiave univoca basata sul nome e sulla posizione (mainboard/sideboard)
                         chiave = (nome_carta, is_sideboard)
-                        
-                        # Se la carta è già presente, sommiamo la quantità. Altrimenti la inizializziamo.
                         if chiave in carte_aggregate:
                             carte_aggregate[chiave] += quantita
                         else:

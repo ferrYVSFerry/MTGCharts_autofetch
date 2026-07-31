@@ -88,19 +88,25 @@ def estrai_formato(formato, conn):
                 if aria_label.startswith('Image of '):
                     carta_rappresentativa = aria_label.replace('Image of ', '').strip()
         
-        # Estrazione percentuale meta
-        stats_container = archetype.find('div', class_='archetype-tile-statistics')
+        # === NOVITÀ: ESTRAZIONE PERCENTUALE META ROBUSTA ===
         percentuale_val = None
-        if stats_container:
-            stats_values = stats_container.find_all('div', class_='archetype-tile-statistic-value')
-            if stats_values:
-                raw_perc = stats_values[0].text.strip().replace('%', '')
+        # Cerchiamo direttamente tutte le classi valore senza passare per il container padre
+        stats_values = archetype.find_all('div', class_='archetype-tile-statistic-value')
+        
+        for stat in stats_values:
+            testo_stat = stat.text.strip()
+            # La percentuale ha sempre il simbolo %
+            if '%' in testo_stat:
+                # Estraiamo SOLO i numeri e il punto decimale, ignorando lettere o spazi extra
+                numeri_puliti = ''.join(c for c in testo_stat if c.isdigit() or c == '.')
                 try:
-                    percentuale_val = float(raw_perc)
+                    if numeri_puliti:
+                        percentuale_val = float(numeri_puliti)
                 except ValueError:
                     percentuale_val = None
+                break # Percentuale trovata, usciamo dal ciclo
 
-        print(f"[{indice}/{len(mazzi_meta)}] Salvataggio: {nome_mazzo} (Copertina: {carta_rappresentativa})")
+        print(f"[{indice}/{len(mazzi_meta)}] Salvataggio: {nome_mazzo} (Meta: {percentuale_val}%)")
         
         # 2. Inserimento Mazzo su DB tramite SQL
         deck_id = None

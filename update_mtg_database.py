@@ -26,7 +26,7 @@ TEMP_MTGJSON_PRICES = "AllPricesToday.json"
 TEMP_MTGJSON_IDENTIFIERS = "AllIdentifiers.json"
 
 HEADERS = {
-    "User-Agent": "MtgArbitrageApp-GitHubActions/3.3 (info@mtgarbitrage.com)",
+    "User-Agent": "MtgArbitrageApp-GitHubActions/3.4 (info@mtgarbitrage.com)",
     "Accept": "application/json"
 }
 
@@ -136,26 +136,20 @@ def is_playable(card):
 
 def calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate):
     """Calculates Arbitrage Score, Estimated Net Profit, and ROI Ratio."""
-    # Controllo per evitare divisioni per zero anche sul prezzo USD
     if not price_eur or not price_usd or price_eur <= 0 or price_usd <= 0:
         return None, None, None
 
     rank = edhrec_rank if edhrec_rank is not None else 10000
     
-    # Conversione dinamica USD -> EUR
     base_cost_eur = price_usd * exchange_rate
     
-    # Applicazione tasse totali escluse spese di spedizione (IVA + eventuali dazi)
     if base_cost_eur <= 150.00:
         landed_cost = base_cost_eur * 1.22  # 22% IVA
     else:
         landed_cost = base_cost_eur * 1.25  # 22% IVA + 3% Dazi Doganali
 
-    # Calcolo del profitto netto
     estimated_profit = price_eur - landed_cost
     
-    # NUOVO CALCOLO: Rapporto Profitto / Costo di Acquisto
-    # Esempio: se spendo 10€ e guadagno netto 5€, il ratio è 0.5 (ovvero 50%)
     profit_ratio = round(estimated_profit / landed_cost, 4) if landed_cost > 0 else None
 
     try:
@@ -188,8 +182,10 @@ def process_single_card(card, tcg_price_map, exchange_rate):
     legal_formats = [fmt for fmt in MAJOR_FORMATS if legalities.get(fmt) in ["legal", "restricted"]]
     edhrec_rank = card.get("edhrec_rank")
     
-    # Adesso la funzione restituisce tre valori
     arbitrage_score, estimated_profit_eur, profit_ratio = calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate)
+    
+    # Estrazione del tipo di carta (es. "Instant", "Creature — Goblin")
+    card_type = card.get("type_line", "")
     
     return (
         card.get("id"),
@@ -203,7 +199,8 @@ def process_single_card(card, tcg_price_map, exchange_rate):
         card.get("set_type"),
         arbitrage_score,
         estimated_profit_eur,
-        profit_ratio # <-- Il nuovo campo aggiunto alla tupla
+        profit_ratio,
+        card_type # <-- Il nuovo campo aggiunto
     )
 
 
@@ -292,12 +289,12 @@ def main():
     conn = connection_pool.getconn()
     try:
         with conn.cursor() as cursor:
-            # Query aggiornata con la nuova colonna profit_ratio
+            # Query aggiornata con la colonna card_type
             upsert_query = """
                 INSERT INTO public.cards (
                     scryfall_id, name, set_code, price_eur, price_usd, 
                     price_usd_median, legal_formats, edhrec_rank, set_type,
-                    arbitrage_score, estimated_profit_eur, profit_ratio
+                    arbitrage_score, estimated_profit_eur, profit_ratio, card_type
                 )
                 VALUES %s
                 ON CONFLICT (scryfall_id) 
@@ -310,7 +307,8 @@ def main():
                     set_type = EXCLUDED.set_type,
                     arbitrage_score = EXCLUDED.arbitrage_score,
                     estimated_profit_eur = EXCLUDED.estimated_profit_eur,
-                    profit_ratio = EXCLUDED.profit_ratio;
+                    profit_ratio = EXCLUDED.profit_ratio,
+                    card_type = EXCLUDED.card_type;
             """
             execute_values(cursor, upsert_query, records, page_size=1000)
         conn.commit()

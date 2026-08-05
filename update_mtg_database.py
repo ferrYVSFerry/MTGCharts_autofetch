@@ -1,4 +1,24 @@
-"""update_mtg_database.py"""
+"""
+MTG Database Synchronization Pipeline
+=====================================
+This script automates the daily extraction, transformation, and loading (ETL) 
+of Magic: The Gathering card data into a Supabase PostgreSQL instance.
+
+Core Workflow:
+1. Fetches the live USD to EUR exchange rate via a public API.
+2. Retrieves the daily bulk card dataset from Scryfall (handles both JSON and JSONL formats).
+3. Downloads and extracts daily pricing and product identifier data from MTGJSON.
+4. Constructs a localized hash map linking TCGplayer IDs to median retail prices.
+5. Processes Scryfall records: filters non-playable entities, merges pricing data, 
+   and calculates custom Arbitrage Scores, ROI ratios, and landed costs.
+6. Executes a bulk UPSERT into the Supabase database. Utilizes progressive chunking 
+   and strict type casting to prevent PostgreSQL memory commitment saturation (OOM risk) 
+   and ensure type safety for UUIDs and arrays.
+
+Environment Variables:
+- SUPABASE_DB_URL: PostgreSQL connection string.
+"""
+
 import os
 import sys
 import json
@@ -19,7 +39,7 @@ EXCHANGE_RATE_API_URL = "https://api.frankfurter.app/latest?from=USD&to=EUR"
 
 DATABASE_URL = os.getenv("SUPABASE_DB_URL")
 
-# File paths in GitHub Actions workspace
+# Temporary file paths in GitHub Actions workspace
 TEMP_SCRYFALL_FILE = "scryfall_raw.dat"
 TEMP_MTGJSON_PRICES_ZIP = "AllPricesToday.json.zip"
 TEMP_MTGJSON_IDENTIFIERS_ZIP = "AllIdentifiers.json.zip"
@@ -50,14 +70,14 @@ def get_usd_to_eur_rate():
             print(f"   Live rate fetched: 1 USD = {rate} EUR")
             return float(rate)
         else:
-            raise ValueError("Rate not found in API response")
+            raise ValueError("Rate not found in API response payload.")
     except Exception as e:
-        print(f"   WARNING: Failed to fetch live rate ({e}). Using fallback rate of 0.92")
+        print(f"   WARNING: Exchange rate fetch failed ({e}). Falling back to 0.92 default.")
         return 0.92
 
 
 def download_file(url, filepath, description):
-    """Downloads a file from a URL with basic error handling."""
+    """Downloads a file from a remote endpoint using streaming to optimize memory allocation."""
     print(f"-> Downloading: {description}...")
     response = requests.get(url, stream=True, headers=HEADERS)
     response.raise_for_status()
@@ -65,21 +85,24 @@ def download_file(url, filepath, description):
         for chunk in response.iter_content(chunk_size=8192):
             if chunk:
                 f.write(chunk)
-    print(f"   Successfully saved: {filepath}")
+    print(f"   Successfully saved payload to: {filepath}")
 
 
 def extract_zip(zip_path, extract_to="."):
-    """Extracts a ZIP archive and deletes the archive file."""
+    """Extracts a ZIP archive into the specified directory and purges the raw archive to free disk space."""
     print(f"-> Extracting archive: {zip_path}...")
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_to)
     os.remove(zip_path)
-    print("   Extraction completed and ZIP removed.")
+    print("   Extraction completed and source ZIP removed.")
 
 
 def build_mtgjson_price_map():
-    """Reads extracted MTGJSON files and maps TCGplayer IDs to median prices."""
-    print("-> Building TCGplayer ID to Median Price lookup table...")
+    """
+    Parses extracted MTGJSON payloads and builds an O(1) lookup dictionary.
+    Maps TCGplayer Product IDs to their latest median normal paper prices.
+    """
+    print("-> Building TCGplayer ID to Median Price lookup map...")
     
     with open(TEMP_MTGJSON_PRICES, 'r', encoding='utf-8') as f:
         prices_data = json.load(f).get("data", {})
@@ -104,12 +127,15 @@ def build_mtgjson_price_map():
             if median_val is not None:
                 tcg_price_map[str(tcg_id)] = float(median_val)
 
-    print(f"   Successfully mapped {len(tcg_price_map)} prices from MTGJSON.")
+    print(f"   Successfully mapped {len(tcg_price_map)} distinct price nodes from MTGJSON.")
     return tcg_price_map
 
 
 def is_playable(card):
-    """Checks if the card meets basic tournament and format criteria."""
+    """
+    Validates if a card entity meets baseline tournament and format criteria.
+    Filters out basic lands, digital-only, oversized, and memorabilia set subsets.
+    """
     if card.get("released_at", "9999-12-31") > CURRENT_DATE:
         return False
     type_line = card.get("type_line", "")
@@ -136,7 +162,10 @@ def is_playable(card):
 
 
 def calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate):
-    """Calculates Arbitrage Score, Estimated Net Profit, and ROI Ratio."""
+    """
+    Computes financial metrics including the Arbitrage Score, Estimated Net Profit, 
+    and Return on Investment (ROI) ratio, applying simulated import duties and VAT based on thresholds.
+    """
     if not price_eur or not price_usd or price_eur <= 0 or price_usd <= 0:
         return None, None, None
 
@@ -144,16 +173,18 @@ def calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate):
     
     base_cost_eur = price_usd * exchange_rate
     
+    # Apply standard EU tax models (22% VAT, +3% Customs for > 150 EUR)
     if base_cost_eur <= 150.00:
-        landed_cost = base_cost_eur * 1.22  # 22% IVA
+        landed_cost = base_cost_eur * 1.22
     else:
-        landed_cost = base_cost_eur * 1.25  # 22% IVA + 3% Dazi Doganali
+        landed_cost = base_cost_eur * 1.25
 
     estimated_profit = price_eur - landed_cost
     
     profit_ratio = round(estimated_profit / landed_cost, 4) if landed_cost > 0 else None
 
     try:
+        # Weighted logarithmic algorithm to score arbitrage viability against market demand
         denominator = math.sqrt(rank + 1) * math.log(price_eur + 1)
         score = estimated_profit / denominator
         return round(score, 2), round(estimated_profit, 2), profit_ratio
@@ -162,7 +193,10 @@ def calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate):
 
 
 def process_single_card(card, tcg_price_map, exchange_rate):
-    """Helper che estrae i dati dalla singola carta per evitare codice ripetuto."""
+    """
+    Extracts, normalizes, and packages relevant data attributes from a single raw Scryfall payload 
+    into a structured tuple formatted for PostgreSQL bulk insertion.
+    """
     if not is_playable(card):
         return None
         
@@ -185,6 +219,7 @@ def process_single_card(card, tcg_price_map, exchange_rate):
     
     arbitrage_score, estimated_profit_eur, profit_ratio = calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate)
     
+    # Extract the ontological type line for granular card categorization
     card_type = card.get("type_line", "")
     
     return (
@@ -205,10 +240,14 @@ def process_single_card(card, tcg_price_map, exchange_rate):
 
 
 def transform_and_prepare_records(tcg_price_map, exchange_rate):
-    """Filters raw cards, merges datasets, and handles both JSON and JSONL formats."""
-    print("-> Filtering cards and merging datasets...")
+    """
+    Iterates over the Scryfall dataset, dynamically routing between JSON Array and JSONL parsing algorithms.
+    Aggregates valid tuples into a master dataset array.
+    """
+    print("-> Filtering entities and performing dataset joins...")
     records = []
     
+    # Identify binary compression signature for GZIP
     with open(TEMP_SCRYFALL_FILE, 'rb') as test_f:
         magic_number = test_f.read(2)
     is_gzipped = (magic_number == b'\x1f\x8b')
@@ -220,14 +259,14 @@ def transform_and_prepare_records(tcg_price_map, exchange_rate):
         f.seek(0)
         
         if first_char == '[':
-            print("   Formato rilevato: JSON Array standard")
+            print("   Format detected: Standard JSON Array")
             all_cards = json.load(f)
             for card in all_cards:
                 record = process_single_card(card, tcg_price_map, exchange_rate)
                 if record:
                     records.append(record)
         else:
-            print("   Formato rilevato: JSON Lines (JSONL)")
+            print("   Format detected: JSON Lines (JSONL)")
             for line in f:
                 line = line.strip()
                 if not line:
@@ -240,28 +279,28 @@ def transform_and_prepare_records(tcg_price_map, exchange_rate):
                 except json.JSONDecodeError:
                     continue
                     
-    print(f"   Valid cards ready for database UPSERT: {len(records)}")
+    print(f"   Compiled validated tuples for UPSERT sequence: {len(records)}")
     return records
 
 
 def clean_up_temp_files():
-    """Removes temporary raw files to free up runner disk space."""
-    print("-> Cleaning up workspace temporary files...")
+    """Purges intermediate temporary artifacts to avoid IO bloat on the runner instance."""
+    print("-> Executing workspace cleanup...")
     for temp_file in [TEMP_SCRYFALL_FILE, TEMP_MTGJSON_PRICES, TEMP_MTGJSON_IDENTIFIERS]:
         if os.path.exists(temp_file):
             os.remove(temp_file)
-            print(f"   Removed: {temp_file}")
+            print(f"   Purged file artifact: {temp_file}")
 
 
 def main():
     if not DATABASE_URL:
-        raise ValueError("CRITICAL ERROR: SUPABASE_DB_URL environment variable is missing!")
+        raise ValueError("CRITICAL ERROR: 'SUPABASE_DB_URL' environment variable is unassigned.")
 
     print("=== STARTING DAILY MTG DATABASE PIPELINE ===")
     
     exchange_rate = get_usd_to_eur_rate()
     
-    print("\n[Step 1/5] Fetching Scryfall metadata and dataset...")
+    print("\n[Step 1/5] Fetching Scryfall metadata and executing dataset download...")
     response = requests.get(SCRYFALL_BULK_URL, headers=HEADERS)
     response.raise_for_status()
     
@@ -269,22 +308,22 @@ def main():
     download_uri = response_data.get("jsonl_download_uri") or response_data.get("download_uri")
     
     if not download_uri:
-        raise Exception("Could not locate any download URI (jsonl or standard) for Scryfall Default Cards.")
+        raise Exception("Failed to resolve a valid data URI (JSON/JSONL) for Scryfall Default Cards endpoint.")
         
     download_file(download_uri, TEMP_SCRYFALL_FILE, f"Scryfall Bulk Data ({'GZIP JSONL' if 'jsonl' in download_uri else 'JSON'})")
 
-    print("\n[Step 2/5] Fetching MTGJSON compressed datasets...")
+    print("\n[Step 2/5] Fetching MTGJSON compressed dimensional datasets...")
     download_file(MTGJSON_PRICES_URL, TEMP_MTGJSON_PRICES_ZIP, "MTGJSON Prices (ZIP)")
     extract_zip(TEMP_MTGJSON_PRICES_ZIP)
     
     download_file(MTGJSON_IDENTIFIERS_URL, TEMP_MTGJSON_IDENTIFIERS_ZIP, "MTGJSON Identifiers (ZIP)")
     extract_zip(TEMP_MTGJSON_IDENTIFIERS_ZIP)
 
-    print("\n[Step 3/5] Processing, mapping, and calculating scores...")
+    print("\n[Step 3/5] Processing payloads, mapping identifiers, and calculating heuristic scores...")
     tcg_price_map = build_mtgjson_price_map()
     records = transform_and_prepare_records(tcg_price_map, exchange_rate)
 
-    print(f"\n[Step 4/5] Connecting to Supabase and executing bulk UPSERT ({len(records)} records)...")
+    print(f"\n[Step 4/5] Establishing connection pool to Supabase and executing bulk UPSERT ({len(records)} records)...")
     connection_pool = psycopg2.pool.SimpleConnectionPool(1, 5, DATABASE_URL)
     conn = connection_pool.getconn()
     try:
@@ -310,19 +349,20 @@ def main():
                     card_type = EXCLUDED.card_type;
             """
             
-            # --- FIX ERRORE TIPO DATI ---
-            # Questo template effettua il casting esplicito per l'ID (uuid) e per i formati legali (text[])
-            # Prevenendo gli errori di 'type mismatch' su Postgres generati in fase di execute_values.
+            # --- STRICT DATA TYPE CASTING TEMPLATE ---
+            # Enforces explicit runtime casting for UUIDs and text arrays within the target database.
+            # Mitigates native psycopg2 type inference mismatches against strict PostgreSQL schemas.
             val_template = "(%s::uuid, %s, %s, %s, %s, %s, %s::text[], %s, %s, %s, %s, %s, %s)"
             
-            # --- CHUNKING & COMMIT PROGRESSIVO ---
-            # Evita di sforare il Commit limit di Supabase processando e committando blocchi ridotti
+            # --- PROGRESSIVE CHUNKING & TRANSACTION MANAGEMENT ---
+            # Segregates the bulk payload into discrete batches to bypass Supabase Memory Commitment limits.
             CHUNK_SIZE = 5000 
             
             for i in range(0, len(records), CHUNK_SIZE):
                 chunk = records[i:i + CHUNK_SIZE]
                 
-                # page_size=200 alleggerisce il parser Postgres evitando stringhe SQL giganti
+                # A suppressed page_size reduces the dimensions of the Abstract Syntax Tree (AST) 
+                # generated by the PostgreSQL parser, throttling overhead spikes on work_mem.
                 execute_values(
                     cursor, 
                     upsert_query, 
@@ -331,22 +371,24 @@ def main():
                     page_size=200
                 )
                 
-                conn.commit() # Libera immediatamente la memoria per questo batch
-                print(f"   Inviati e committati {len(chunk)} record (Totale: {min(i + CHUNK_SIZE, len(records))}/{len(records)})")
+                # Commit strictly at the chunk level to flush database transaction buffers 
+                # and release kernel memory allocations progressively.
+                conn.commit() 
+                print(f"   Batch successfully committed: {len(chunk)} records (Total synchronized: {min(i + CHUNK_SIZE, len(records))}/{len(records)})")
                 
-        print("   SUCCESS: Database synchronized successfully!")
+        print("   SUCCESS: Target database synchronized with 0 errors.")
     except Exception as e:
-        print(f"   DATABASE ERROR: {e}")
+        print(f"   CRITICAL DATABASE EXCEPTION: {e}")
         conn.rollback()
         raise e
     finally:
         connection_pool.putconn(conn)
         connection_pool.closeall()
         
-    print("\n[Step 5/5] Cleaning up workspace...")
+    print("\n[Step 5/5] Dismantling temporary workspace artifacts...")
     clean_up_temp_files()
     
-    print("\n=== PIPELINE COMPLETED SUCCESSFULLY ===")
+    print("\n=== ETL PIPELINE COMPLETED SUCCESSFULLY ===")
 
 
 if __name__ == "__main__":

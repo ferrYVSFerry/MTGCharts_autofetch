@@ -68,7 +68,7 @@ def download_file(url, filepath, description):
     print(f"   Successfully saved: {filepath}")
 
 
-def extract_zip(zip_path, extract_to=".")):
+def extract_zip(zip_path, extract_to="."):
     """Extracts a ZIP archive and deletes the archive file."""
     print(f"-> Extracting archive: {zip_path}...")
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:

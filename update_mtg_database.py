@@ -1,3 +1,4 @@
+"""update_mtg_database.py"""
 import os
 import sys
 import json
@@ -67,7 +68,7 @@ def download_file(url, filepath, description):
     print(f"   Successfully saved: {filepath}")
 
 
-def extract_zip(zip_path, extract_to="."):
+def extract_zip(zip_path, extract_to=".")):
     """Extracts a ZIP archive and deletes the archive file."""
     print(f"-> Extracting archive: {zip_path}...")
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
@@ -184,7 +185,6 @@ def process_single_card(card, tcg_price_map, exchange_rate):
     
     arbitrage_score, estimated_profit_eur, profit_ratio = calculate_arbitrage_score(price_eur, price_usd, edhrec_rank, exchange_rate)
     
-    # Estrazione del tipo di carta (es. "Instant", "Creature — Goblin")
     card_type = card.get("type_line", "")
     
     return (
@@ -200,7 +200,7 @@ def process_single_card(card, tcg_price_map, exchange_rate):
         arbitrage_score,
         estimated_profit_eur,
         profit_ratio,
-        card_type # <-- Il nuovo campo aggiunto
+        card_type
     )
 
 
@@ -284,12 +284,11 @@ def main():
     tcg_price_map = build_mtgjson_price_map()
     records = transform_and_prepare_records(tcg_price_map, exchange_rate)
 
-    print("\n[Step 4/5] Connecting to Supabase and executing bulk UPSERT...")
+    print(f"\n[Step 4/5] Connecting to Supabase and executing bulk UPSERT ({len(records)} records)...")
     connection_pool = psycopg2.pool.SimpleConnectionPool(1, 5, DATABASE_URL)
     conn = connection_pool.getconn()
     try:
         with conn.cursor() as cursor:
-            # Query aggiornata con la colonna card_type
             upsert_query = """
                 INSERT INTO public.cards (
                     scryfall_id, name, set_code, price_eur, price_usd, 
@@ -310,8 +309,31 @@ def main():
                     profit_ratio = EXCLUDED.profit_ratio,
                     card_type = EXCLUDED.card_type;
             """
-            execute_values(cursor, upsert_query, records, page_size=1000)
-        conn.commit()
+            
+            # --- FIX ERRORE TIPO DATI ---
+            # Questo template effettua il casting esplicito per l'ID (uuid) e per i formati legali (text[])
+            # Prevenendo gli errori di 'type mismatch' su Postgres generati in fase di execute_values.
+            val_template = "(%s::uuid, %s, %s, %s, %s, %s, %s::text[], %s, %s, %s, %s, %s, %s)"
+            
+            # --- CHUNKING & COMMIT PROGRESSIVO ---
+            # Evita di sforare il Commit limit di Supabase processando e committando blocchi ridotti
+            CHUNK_SIZE = 5000 
+            
+            for i in range(0, len(records), CHUNK_SIZE):
+                chunk = records[i:i + CHUNK_SIZE]
+                
+                # page_size=200 alleggerisce il parser Postgres evitando stringhe SQL giganti
+                execute_values(
+                    cursor, 
+                    upsert_query, 
+                    chunk, 
+                    template=val_template, 
+                    page_size=200
+                )
+                
+                conn.commit() # Libera immediatamente la memoria per questo batch
+                print(f"   Inviati e committati {len(chunk)} record (Totale: {min(i + CHUNK_SIZE, len(records))}/{len(records)})")
+                
         print("   SUCCESS: Database synchronized successfully!")
     except Exception as e:
         print(f"   DATABASE ERROR: {e}")
